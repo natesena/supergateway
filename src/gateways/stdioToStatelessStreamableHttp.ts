@@ -126,11 +126,51 @@ export async function stdioToStatelessStreamableHttp(
       })
 
       await server.connect(transport)
-      const child = spawn(stdioCmd, { shell: true })
+
+      // Spawn detached so the /bin/sh wrapper AND its node child form one process
+      // group we can kill as a unit. Without detached, child.kill() signals only
+      // the shell wrapper and the real MCP server (node) is reparented to PID 1 and
+      // leaks forever. See supercorp-ai/supergateway#108.
+      const child = spawn(stdioCmd, { shell: true, detached: true })
+      const pid = child.pid
+
+      // Idempotent teardown: kill the whole process group, then close the transport.
+      let cleanedUp = false
+      const cleanup = (reason: string) => {
+        if (cleanedUp) return
+        cleanedUp = true
+        logger.info(`Cleaning up child (${reason})`)
+        if (typeof pid === 'number') {
+          try {
+            process.kill(-pid, 'SIGTERM')
+          } catch {
+            try {
+              child.kill('SIGTERM')
+            } catch {}
+          }
+          setTimeout(() => {
+            try {
+              process.kill(-pid, 'SIGKILL')
+            } catch {}
+          }, 500).unref()
+        }
+        try {
+          transport.close()
+        } catch {}
+      }
+
       child.on('exit', (code, signal) => {
         logger.error(`Child exited: code=${code}, signal=${signal}`)
-        transport.close()
+        cleanedUp = true // group already gone; don't signal it
+        try {
+          transport.close()
+        } catch {}
       })
+
+      // The reliable teardown trigger: the HTTP response/stream closing. This fires
+      // even when the response is a long-lived SSE stream, where transport.onclose
+      // never fires (handleRequest never resolves) — the exact path that leaked.
+      res.on('close', () => cleanup('res close'))
 
       // State tracking for initialization flow
       let isInitialized = false
@@ -242,12 +282,12 @@ export async function stdioToStatelessStreamableHttp(
 
       transport.onclose = () => {
         logger.info('StreamableHttp connection closed')
-        child.kill()
+        cleanup('transport onclose')
       }
 
       transport.onerror = (err) => {
         logger.error(`StreamableHttp error:`, err)
-        child.kill()
+        cleanup('transport onerror')
       }
 
       await transport.handleRequest(req, res, req.body)
