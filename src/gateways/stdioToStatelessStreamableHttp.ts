@@ -6,6 +6,8 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import {
   JSONRPCMessage,
   isInitializeRequest,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  LATEST_PROTOCOL_VERSION,
 } from '@modelcontextprotocol/sdk/types.js'
 import { Logger } from '../types.js'
 import { getVersion } from '../lib/getVersion.js'
@@ -249,12 +251,31 @@ export async function stdioToStatelessStreamableHttp(
         // from cache (echoing the client's requested protocol version) instead of
         // re-initializing — which would reset the shared child.
         if (isInitializeRequest(msg)) {
+          // Negotiate the protocol version EXACTLY like the SDK Server does
+          // (server/index.js _oninitialize): honor the client's requested
+          // version only if we support it, otherwise fall back to the latest
+          // version our bundled SDK knows.
+          //
+          // Why this matters: blindly echoing the client's requested version
+          // breaks newer clients. claude.ai requests a protocol version newer
+          // than this SDK supports; per spec the client then sends THAT version
+          // in the `Mcp-Protocol-Version` header on every subsequent POST, and
+          // the SDK's StreamableHTTPServerTransport.validateProtocolVersion
+          // rejects it with HTTP 400 ("Unsupported protocol version"). The
+          // original per-request gateway never hit this because it let the SDK
+          // Server negotiate (and clamp) the version. The offline SDK test
+          // client never hit it either, because it is pinned to this same SDK
+          // and so requests a supported version. Clamping here restores parity.
+          const requestedVersion = anyMsg.params?.protocolVersion
+          const negotiatedVersion = SUPPORTED_PROTOCOL_VERSIONS.includes(
+            requestedVersion,
+          )
+            ? requestedVersion
+            : ((cachedInitResult as any)?.protocolVersion ??
+              LATEST_PROTOCOL_VERSION)
           const result = {
             ...(cachedInitResult || {}),
-            protocolVersion:
-              anyMsg.params?.protocolVersion ??
-              (cachedInitResult as any)?.protocolVersion ??
-              protocolVersion,
+            protocolVersion: negotiatedVersion,
           }
           try {
             transport.send({ jsonrpc: '2.0', id: anyMsg.id, result } as any)

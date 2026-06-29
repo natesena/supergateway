@@ -68,7 +68,7 @@ EvanSchalton's community workaround (a `docker:cli` sidecar that reaps children 
   to supergateway (PID 1 in the container), so age/connection heuristics are needed instead, which
   risk killing in-use children. Tracked separately.
 
-### 4. Single-shared-child multiplexer 🟡 ARCHITECTURALLY RIGHT, fails claude.ai interop
+### 4. Single-shared-child multiplexer ✅ FIXED (root cause found 2026-06-29)
 
 Replace per-request spawn with **one persistent child**; multiplex all HTTP requests onto it by
 remapping each caller's JSON-RPC id to a unique internal id and routing replies back. No
@@ -82,12 +82,28 @@ per-request spawn → nothing to leak; no per-request kill → nothing to kill m
   mcp-server-filesystem _discard_ its argv `/vault` dir (`No valid root directories provided by
 client`). Fix = **don't answer `roots/list`** (let it time out → server uses argv, matching the
   original).
-- **Still fails prod:** through mcp-front/claude.ai the `POST` returns **400** consistently (two
-  calls 5 min apart; plus `notifications/cancelled` = claude.ai timing out). The remaining
-  incompatibility is in claude.ai's exact streamable-http handshake and **could not be reproduced
-  offline** (see harness notes). Suspected: intercepting `initialize` via `transport.send`
-  conflicts with the SDK `StreamableHTTPServerTransport`'s own initialize state machine — untested.
-- **Verdict:** best approach; needs a faithful claude.ai-behavior harness to finish.
+- **Was failing prod (now fixed):** through mcp-front/claude.ai the follow-up `POST` returned
+  **400** consistently. **Root cause (found 2026-06-29 by reading the SDK, not by prod cycles):**
+  the multiplexer answered `initialize` by **echoing the client's requested `protocolVersion`
+  verbatim**. The SDK `Server` it replaced does NOT — `server/index.js` `_oninitialize` clamps:
+  `SUPPORTED_PROTOCOL_VERSIONS.includes(requested) ? requested : LATEST_PROTOCOL_VERSION`. The
+  bundled SDK (1.18.2) tops out at `2025-06-18`; **claude.ai (2026) requests a newer version**, so
+  the echo made claude.ai stamp that unsupported version into its `Mcp-Protocol-Version` header on
+  every subsequent POST, and `StreamableHTTPServerTransport.validateProtocolVersion`
+  (`streamableHttp.js:513`) then 400s with _"Unsupported protocol version"_. This is why it never
+  reproduced offline: the offline SDK client is **pinned to the same 1.18.2**, so it requests a
+  supported version and the echo is harmless.
+- **Fix:** clamp exactly like the SDK Server (honor requested only if supported, else fall back to
+  the child's negotiated version / `LATEST_PROTOCOL_VERSION`). One change in the `isInitializeRequest`
+  branch of `stdioToStatelessStreamableHttp.ts`.
+- **Faithful harness (the "real blocker", now trivial):** `/tmp/muxtest/` — a tiny stdio MCP child
+  - a raw-`fetch` client that, per spec, sends on its follow-up POST whatever version the server
+    returned at initialize. The ONLY claude.ai behavior that mattered was _requesting a protocol
+    version newer than the gateway's SDK_; nothing else about claude.ai needed replicating, and
+    mcp-front isn't needed in the loop (the 400 originates in supergateway's SDK transport; mcp-front
+    only forwards the header). Repro: requesting `2026-03-26` → `tools/list` 400 on the old code,
+    200 on the fixed code; every supported version passes on both.
+- **Verdict:** ✅ resolved offline. Remaining work is deploy + a prod A/B confirmation cycle.
 
 ## Reproduction / harness attempts (the real blocker)
 
@@ -119,14 +135,18 @@ client`). Fix = **don't answer `roots/list`** (let it time out → server uses a
 
 ## Where to resume
 
-1. **Build a faithful claude.ai-behavior harness** — a client (or a captured request trace replayed
-   via raw HTTP) that opens the `GET /sse` stream, tolerates its 503, and issues claude.ai's exact
-   POST sequence, run through a local mcp-front. Without this, every iteration is a slow prod cycle.
-2. With that gate, finish the **multiplexer**: most likely fix is to stop intercepting `initialize`
-   with a raw `transport.send` and instead let the SDK `Server`/transport handle the protocol
-   (register request handlers), so claude.ai's handshake isn't short-circuited.
-3. Fallback if multiplexer interop proves intractable: a **host-side reaper** (not `docker exec` —
-   that's broken) keyed on a real idle/connection signal, paired with the existing `mem_limit`.
+Root cause is found and fixed offline (see attempt #4). Remaining steps to ship the durable fix:
+
+1. **Deploy the fork** — rebuild the obsidian MCP image (the Dockerfile clones the
+   `fix/stateless-child-process-leak` branch), recreate the **personal `obsidian-mcp` first**.
+2. **Prod A/B confirmation** — call the real `mcp__claude_ai_Kismet_Obsidian` tool (a read + a
+   reversible edit) against the new image; confirm `tools/list` no longer 400s and child count
+   stays at **1** (`docker top <c> | grep -c mcp-server-filesystem`).
+3. Roll to **`company-obsidian-mcp`**, keep `mem_limit: 2g` as the permanent backstop.
+
+If for any reason the multiplexer still misbehaves through mcp-front, the fallback remains a
+host-side reaper (not `docker exec` — broken on the NAS) paired with `mem_limit`.
 
 Status as of this writing: both containers on **known-good + `mem_limit`** (MCP working, leak
-contained). The leak is a capped annoyance, not an outage risk.
+contained). The durable fix is built and offline-proven on branch
+`fix/stateless-child-process-leak`, not yet deployed.
