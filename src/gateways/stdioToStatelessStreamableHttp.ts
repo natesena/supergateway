@@ -144,14 +144,14 @@ export async function stdioToStatelessStreamableHttp(
       deliver(msg)
       return
     }
-    // Server→client request. mcp-server-filesystem only issues roots/list (during
-    // initialize); answer with no extra roots so the handshake completes without a
-    // client — the child already has its allowed dir from argv.
-    if (msg && msg.method === 'roots/list' && msg.id != null) {
-      child.stdin.write(
-        JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { roots: [] } }) +
-          '\n',
-      )
+    // Server→client request (the child asking US something — e.g. roots/list during
+    // initialize). We deliberately DO NOT answer it: answering roots/list with an empty
+    // list makes mcp-server-filesystem discard its argv directory ("No valid root
+    // directories provided by client"). Leaving it unanswered makes the server fall back
+    // to its argv directory — exactly what the original gateway did (there this request
+    // merely timed out). So drop server→client requests; the child serves from argv.
+    if (msg && typeof msg.method === 'string') {
+      logger.info(`Ignoring server→client request/notification: ${msg.method}`)
       return
     }
     logger.info(`Unrouted child message: ${JSON.stringify(msg)}`)
