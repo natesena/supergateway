@@ -1,6 +1,6 @@
 import express from 'express'
 import cors, { type CorsOptions } from 'cors'
-import { spawn } from 'child_process'
+import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import {
@@ -63,6 +63,23 @@ const createInitializedNotification = (): JSONRPCMessage => ({
   method: 'notifications/initialized',
 })
 
+/**
+ * Stateless stdio→StreamableHttp gateway, implemented as a SHARED-CHILD MULTIPLEXER.
+ *
+ * The upstream implementation spawned one stdio child PER HTTP request. That leaks
+ * (supercorp-ai/supergateway#108: transport.onclose never fires for open SSE responses,
+ * and child.kill only signals the /bin/sh wrapper), and the obvious "reap on res close"
+ * patch breaks streaming clients (e.g. claude.ai via mcp-front) by killing the child
+ * mid-handshake.
+ *
+ * This version runs ONE long-lived child for the whole process. Every HTTP request is
+ * multiplexed onto that child by remapping the caller's JSON-RPC id to a globally-unique
+ * internal id, then routing the child's response back to the originating HTTP response.
+ * Consequences:
+ *   - nothing is spawned per request  → nothing to leak
+ *   - nothing is killed per request    → nothing to kill mid-handshake
+ * Safe because the wrapped server (e.g. mcp-server-filesystem) is stateless per call.
+ */
 export async function stdioToStatelessStreamableHttp(
   args: StdioToStreamableHttpArgs,
 ) {
@@ -84,7 +101,9 @@ export async function stdioToStatelessStreamableHttp(
   logger.info(`  - stdio: ${stdioCmd}`)
   logger.info(`  - streamableHttpPath: ${streamableHttpPath}`)
   logger.info(`  - protocolVersion: ${protocolVersion}`)
-
+  logger.info(
+    `  - mode: shared-child multiplexer (one persistent stdio child; no per-request spawn)`,
+  )
   logger.info(
     `  - CORS: ${corsOrigin ? `enabled (${serializeCorsOrigin({ corsOrigin })})` : 'disabled'}`,
   )
@@ -103,20 +122,107 @@ export async function stdioToStatelessStreamableHttp(
 
   for (const ep of healthEndpoints) {
     app.get(ep, (_req, res) => {
-      setResponseHeaders({
-        res,
-        headers,
-      })
+      setResponseHeaders({ res, headers })
       res.send('ok')
     })
   }
 
-  app.post(streamableHttpPath, async (req, res) => {
-    // In stateless mode, create a new instance of transport and server for each request
-    // to ensure complete isolation. A single instance would cause request ID collisions
-    // when multiple clients connect concurrently.
+  // ── The single shared stdio child ───────────────────────────────────────────
+  let child: ChildProcessWithoutNullStreams
+  let nextInternalId = 1
+  // internalId → deliver the child's reply to the right HTTP request
+  const inflight = new Map<number, (msg: JSONRPCMessage) => void>()
+  let cachedInitResult: Record<string, unknown> | null = null
+  let resolveReady: () => void = () => {}
+  let childReady = new Promise<void>((r) => (resolveReady = r))
 
+  const dispatchChildMessage = (msg: any) => {
+    // Reply to something we forwarded (a client request, or our own startup initialize).
+    if (msg && msg.id != null && inflight.has(msg.id)) {
+      const deliver = inflight.get(msg.id)!
+      inflight.delete(msg.id)
+      deliver(msg)
+      return
+    }
+    // Server→client request. mcp-server-filesystem only issues roots/list (during
+    // initialize); answer with no extra roots so the handshake completes without a
+    // client — the child already has its allowed dir from argv.
+    if (msg && msg.method === 'roots/list' && msg.id != null) {
+      child.stdin.write(
+        JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { roots: [] } }) +
+          '\n',
+      )
+      return
+    }
+    logger.info(`Unrouted child message: ${JSON.stringify(msg)}`)
+  }
+
+  const initChild = () => {
+    const initId = nextInternalId++
+    inflight.set(initId, (resp: any) => {
+      cachedInitResult = (resp && resp.result) || null
+      child.stdin.write(JSON.stringify(createInitializedNotification()) + '\n')
+      logger.info('Shared child initialized')
+      resolveReady()
+    })
+    child.stdin.write(
+      JSON.stringify(createInitializeRequest(initId, protocolVersion)) + '\n',
+    )
+  }
+
+  const spawnChild = () => {
+    child = spawn(stdioCmd, { shell: true })
+
+    let buffer = ''
+    child.stdout.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString('utf8')
+      const lines = buffer.split(/\r?\n/)
+      buffer = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line.trim()) continue
+        try {
+          dispatchChildMessage(JSON.parse(line))
+        } catch {
+          logger.error(`Child non-JSON: ${line}`)
+        }
+      }
+    })
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      logger.error(`Child stderr: ${chunk.toString('utf8')}`)
+    })
+
+    child.on('exit', (code, signal) => {
+      logger.error(
+        `Shared child exited: code=${code}, signal=${signal} — failing inflight and respawning`,
+      )
+      // Don't hang the in-flight HTTP responses.
+      for (const deliver of inflight.values()) {
+        try {
+          deliver({
+            jsonrpc: '2.0',
+            id: 0,
+            error: { code: -32000, message: 'stdio child exited' },
+          } as any)
+        } catch {}
+      }
+      inflight.clear()
+      cachedInitResult = null
+      childReady = new Promise<void>((r) => (resolveReady = r))
+      setTimeout(() => {
+        spawnChild()
+        initChild()
+      }, 250).unref()
+    })
+  }
+
+  spawnChild()
+  initChild()
+
+  app.post(streamableHttpPath, async (req, res) => {
     try {
+      await childReady
+
       const server = new Server(
         { name: 'supergateway', version: getVersion() },
         { capabilities: {} },
@@ -124,171 +230,65 @@ export async function stdioToStatelessStreamableHttp(
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       })
-
       await server.connect(transport)
 
-      // Spawn detached so the /bin/sh wrapper AND its node child form one process
-      // group we can kill as a unit. Without detached, child.kill() signals only
-      // the shell wrapper and the real MCP server (node) is reparented to PID 1 and
-      // leaks forever. See supercorp-ai/supergateway#108.
-      const child = spawn(stdioCmd, { shell: true, detached: true })
-      const pid = child.pid
-
-      // Idempotent teardown: kill the whole process group, then close the transport.
-      let cleanedUp = false
-      const cleanup = (reason: string) => {
-        if (cleanedUp) return
-        cleanedUp = true
-        logger.info(`Cleaning up child (${reason})`)
-        if (typeof pid === 'number') {
-          try {
-            process.kill(-pid, 'SIGTERM')
-          } catch {
-            try {
-              child.kill('SIGTERM')
-            } catch {}
-          }
-          setTimeout(() => {
-            try {
-              process.kill(-pid, 'SIGKILL')
-            } catch {}
-          }, 500).unref()
-        }
-        try {
-          transport.close()
-        } catch {}
+      // ids this request put on the shared child, so a disconnect can't deliver to a
+      // dead transport (and we never leak map entries).
+      const myIds = new Set<number>()
+      let closed = false
+      const dropMyIds = () => {
+        closed = true
+        for (const id of myIds) inflight.delete(id)
+        myIds.clear()
       }
 
-      child.on('exit', (code, signal) => {
-        logger.error(`Child exited: code=${code}, signal=${signal}`)
-        cleanedUp = true // group already gone; don't signal it
-        try {
-          transport.close()
-        } catch {}
-      })
-
-      // The reliable teardown trigger: the HTTP response/stream closing. This fires
-      // even when the response is a long-lived SSE stream, where transport.onclose
-      // never fires (handleRequest never resolves) — the exact path that leaked.
-      res.on('close', () => cleanup('res close'))
-
-      // State tracking for initialization flow
-      let isInitialized = false
-      let initializeRequestId: string | number | null = null // Current initialize request ID
-      let isAutoInitializing = false // Flag to indicate if we're auto-initializing
-      let pendingOriginalMessage: JSONRPCMessage | null = null
-
-      let buffer = ''
-      child.stdout.on('data', (chunk: Buffer) => {
-        buffer += chunk.toString('utf8')
-        const lines = buffer.split(/\r?\n/)
-        buffer = lines.pop() ?? ''
-        lines.forEach((line) => {
-          if (!line.trim()) return
-          try {
-            const jsonMsg = JSON.parse(line)
-            logger.info('Child → StreamableHttp:', line)
-
-            // Handle initialize response (both auto and client initiated)
-            if (initializeRequestId && jsonMsg.id === initializeRequestId) {
-              logger.info('Initialize response received')
-              isInitialized = true
-
-              // If this was our auto-initialization, send initialized notification and pending message
-              if (isAutoInitializing) {
-                // Send initialized notification
-                const initializedNotification = createInitializedNotification()
-                logger.info(
-                  `StreamableHttp → Child (initialized): ${JSON.stringify(initializedNotification)}`,
-                )
-                child.stdin.write(
-                  JSON.stringify(initializedNotification) + '\n',
-                )
-
-                // Now send the original message
-                if (pendingOriginalMessage) {
-                  logger.info(
-                    `StreamableHttp → Child (original): ${JSON.stringify(pendingOriginalMessage)}`,
-                  )
-                  child.stdin.write(
-                    JSON.stringify(pendingOriginalMessage) + '\n',
-                  )
-                  pendingOriginalMessage = null
-                }
-
-                // Reset auto-initialize tracking
-                isAutoInitializing = false
-                initializeRequestId = null
-
-                // Don't forward our auto-initialize response to the client
-                return
-              } else {
-                // Client-initiated initialize response, just reset tracking
-                initializeRequestId = null
-              }
-            }
-
-            try {
-              transport.send(jsonMsg)
-            } catch (e) {
-              logger.error(`Failed to send to StreamableHttp`, e)
-            }
-          } catch {
-            logger.error(`Child non-JSON: ${line}`)
-          }
-        })
-      })
-
-      child.stderr.on('data', (chunk: Buffer) => {
-        logger.error(`Child stderr: ${chunk.toString('utf8')}`)
-      })
-
       transport.onmessage = (msg: JSONRPCMessage) => {
-        logger.info(`StreamableHttp → Child: ${JSON.stringify(msg)}`)
+        const anyMsg = msg as any
 
-        // Check if we need to auto-initialize first
-        if (!isInitialized && !isInitializeRequest(msg)) {
-          // Store the original message and send initialize first
-          pendingOriginalMessage = msg
-          initializeRequestId = `init_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-          isAutoInitializing = true
-
-          logger.info(
-            'Non-initialize message detected, sending auto-initialize request first',
-          )
-          const initRequest = createInitializeRequest(
-            initializeRequestId,
-            protocolVersion,
-          )
-          logger.info(
-            `StreamableHttp → Child (auto-initialize): ${JSON.stringify(initRequest)}`,
-          )
-          child.stdin.write(JSON.stringify(initRequest) + '\n')
-
-          // Don't send the original message yet - it will be sent after initialization
+        // Each client initializes; the shared child is already initialized, so answer
+        // from cache (echoing the client's requested protocol version) instead of
+        // re-initializing — which would reset the shared child.
+        if (isInitializeRequest(msg)) {
+          const result = {
+            ...(cachedInitResult || {}),
+            protocolVersion:
+              anyMsg.params?.protocolVersion ??
+              (cachedInitResult as any)?.protocolVersion ??
+              protocolVersion,
+          }
+          try {
+            transport.send({ jsonrpc: '2.0', id: anyMsg.id, result } as any)
+          } catch (e) {
+            logger.error('Failed to answer initialize', e)
+          }
           return
         }
 
-        // Track initialize request ID (both client and auto)
-        if (isInitializeRequest(msg) && 'id' in msg && msg.id !== undefined) {
-          initializeRequestId = msg.id
-          isAutoInitializing = false // This is client-initiated
-          logger.info(`Tracking initialize request ID: ${msg.id}`)
-        }
+        // Notifications (no id), e.g. notifications/initialized — child already
+        // initialized; nothing to forward.
+        if (anyMsg.id === undefined || anyMsg.id === null) return
 
-        // Send all messages to child process normally
-        child.stdin.write(JSON.stringify(msg) + '\n')
+        // Request: remap id → forward to shared child → route reply back here.
+        const internalId = nextInternalId++
+        myIds.add(internalId)
+        inflight.set(internalId, (childMsg: any) => {
+          myIds.delete(internalId)
+          if (closed) return
+          try {
+            transport.send({ ...childMsg, id: anyMsg.id })
+          } catch (e) {
+            logger.error('Failed to send to StreamableHttp', e)
+          }
+        })
+        child.stdin.write(JSON.stringify({ ...anyMsg, id: internalId }) + '\n')
       }
 
-      transport.onclose = () => {
-        logger.info('StreamableHttp connection closed')
-        cleanup('transport onclose')
-      }
-
+      transport.onclose = () => dropMyIds()
       transport.onerror = (err) => {
-        logger.error(`StreamableHttp error:`, err)
-        cleanup('transport onerror')
+        logger.error('StreamableHttp error:', err)
+        dropMyIds()
       }
+      res.on('close', dropMyIds)
 
       await transport.handleRequest(req, res, req.body)
     } catch (error) {
@@ -306,29 +306,23 @@ export async function stdioToStatelessStreamableHttp(
     }
   })
 
-  app.get(streamableHttpPath, async (req, res) => {
+  app.get(streamableHttpPath, async (_req, res) => {
     logger.info('Received GET MCP request')
     res.writeHead(405).end(
       JSON.stringify({
         jsonrpc: '2.0',
-        error: {
-          code: -32000,
-          message: 'Method not allowed.',
-        },
+        error: { code: -32000, message: 'Method not allowed.' },
         id: null,
       }),
     )
   })
 
-  app.delete(streamableHttpPath, async (req, res) => {
+  app.delete(streamableHttpPath, async (_req, res) => {
     logger.info('Received DELETE MCP request')
     res.writeHead(405).end(
       JSON.stringify({
         jsonrpc: '2.0',
-        error: {
-          code: -32000,
-          message: 'Method not allowed.',
-        },
+        error: { code: -32000, message: 'Method not allowed.' },
         id: null,
       }),
     )
